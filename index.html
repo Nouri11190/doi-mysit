@@ -123,8 +123,14 @@
       <h2>📦 Batch mode</h2>
       <div class="lock" id="batch-lock">
         🔒 <b>Batch mode is a Pro feature.</b> Free plan: single lookups only.<br>
-        Pro ($3–5/mo or ~$25/yr): batch processing, ad-free, citation export.<br><br>
-        <button class="btn small" id="btn-unlock">Try Pro (demo unlock)</button>
+        Pro (~$25/yr): batch processing, ad-free, citation export.<br><br>
+        <a class="btn small" style="text-decoration:none;display:inline-block" id="btn-buy" href="#" target="_blank" rel="noopener">Buy Pro</a>
+        <div class="hint" style="margin-top:10px">Already purchased? Paste your license key (emailed after checkout):</div>
+        <div class="searchbox" style="margin-top:6px">
+          <input id="license-input" placeholder="XXXXXXXX-XXXXXXXX-XXXXXXXX-XXXXXXXX" autocomplete="off">
+          <button class="btn small" id="btn-activate">Activate</button>
+        </div>
+        <div id="license-status"></div>
       </div>
       <div id="batch-ui" class="hidden">
         <textarea id="batch-input" placeholder="One DOI or URL per line&#10;10.1038/nature12373&#10;https://doi.org/10.1371/journal.pone.0000001&#10;10.1056/NEJMoa2001193"></textarea>
@@ -182,7 +188,10 @@
 <script>
 /* ============ CONFIG ============ */
 const DEFAULT_EMAIL = "jeffreybrook24@gmail.com";
-const DEFAULT_COREKEY 
+const DEFAULT_COREKEY = "UeqtzugkKLdFxJja9p27ily5EOPIM3wb";
+// Fill in after creating the Gumroad product (see setup notes) — this is the
+// short slug from your product's URL, e.g. gumroad.com/l/doi-oa-finder-pro
+const GUMROAD_PRODUCT_PERMALINK = "YOUR-GUMROAD-PERMALINK";
 const DOI_RE = /10\.\d{4,9}\/[-._;()\/:A-Za-z0-9]+/;
 
 /* ============ STATE / STORAGE ============ */
@@ -191,7 +200,7 @@ const store = {
   set(k, v){ try{ localStorage.setItem("doaf_"+k, JSON.stringify(v)); }catch(e){} },
   del(k){ try{ localStorage.removeItem("doaf_"+k);}catch(e){} }
 };
-let settings = store.get("settings", { dark:false, coreKey:"", email:DEFAULT_EMAIL, pro:false });
+let settings = store.get("settings", { dark:false, coreKey:"", email:DEFAULT_EMAIL, pro:false, licenseKey:"" });
 let cache   = store.get("cache", {});       // doi -> {result, ts}
 let recent  = store.get("recent", []);      // [{doi,title,found,ts}]
 let library = store.get("library", []);     // [{doi,title,url,source,ts}]
@@ -215,13 +224,16 @@ function extractDOI(raw){
   if(!raw) return null;
   let s = raw.trim();
   // strip common URL prefixes
+  // FIX: the second .replace() previously passed `s` (the whole string) as the
+  // replacement value instead of "", which spliced the entire input back into
+  // the match location instead of stripping it. Now correctly strips to "".
   s = s.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "")
-       .replace(/^https?:\/\/(www\.)?(arxiv\.org\/(abs|pdf)\/|link\.springer\.com\/article\/|nature\.com\/articles\/|sciencedirect\.com\/science\/article\/(pii|abs)\/)/i, s);
+       .replace(/^https?:\/\/(www\.)?(arxiv\.org\/(abs|pdf)\/|link\.springer\.com\/article\/|nature\.com\/articles\/|sciencedirect\.com\/science\/article\/(pii|abs)\/)/i, "");
   // handle arXiv id -> not a DOI, caller deals with it
   const m = s.match(DOI_RE);
   if(!m) return null;
   let doi = m[0].replace(/[.,;)]+$/,""); // trim trailing punctuation
-  return doi.toLowerCase() === doi ? doi : doi;
+  return doi.toLowerCase(); // FIX: original ternary returned the same value on both branches (dead code); normalize to lowercase, which DOIs are case-insensitive for anyway.
 }
 
 /* ============ API SOURCES (each returns {found, pdf, landing, title, authors, source} or throws) ============ */
@@ -237,7 +249,13 @@ async function tryUnpaywall(doi){
       title:d.title || d.journal_name || doi, authors:(d.z_authors||[]).map(a=>[a.given,a.family].filter(Boolean).join(" ")).join(", "),
       source:"Unpaywall", license:d.best_oa_location.license, version:d.best_oa_location.version};
   }
-  return {found:false, stop:true}; // known DOI, but no legal OA copy
+  // FIX: this used to be stop:true, which short-circuited the ENTIRE fallback
+  // chain the moment Unpaywall said "no OA" — meaning Semantic Scholar, arXiv,
+  // and CORE were never even queried for any paper Unpaywall already knew about.
+  // That defeats the point of having multiple sources: CORE/S2 often have a
+  // green-OA or repository copy Unpaywall doesn't index. Now it correctly
+  // continues down the chain.
+  return {found:false, stop:false}; // known DOI, but no legal OA copy per Unpaywall — keep trying other sources
 }
 
 async function trySemanticScholar(doi){
@@ -415,13 +433,72 @@ function renderLibrary(){
   el.querySelectorAll("[data-rm]").forEach(b=> b.onclick = ()=>{ library.splice(+b.dataset.rm,1); store.set("library", library); renderLibrary(); });
 }
 
-/* ============ BATCH ============ */
-document.getElementById("btn-unlock").onclick = ()=>{
-  settings.pro = true; store.set("settings", settings);
+/* ============ BATCH / LICENSING ============ */
+document.getElementById("btn-buy").href = `https://gumroad.com/l/${encodeURIComponent(GUMROAD_PRODUCT_PERMALINK)}`;
+
+function unlockPro(){
   document.getElementById("batch-lock").classList.add("hidden");
   document.getElementById("batch-ui").classList.remove("hidden");
+}
+function lockPro(msg){
+  settings.pro = false; store.set("settings", settings);
+  document.getElementById("batch-lock").classList.remove("hidden");
+  document.getElementById("batch-ui").classList.add("hidden");
+  if(msg) document.getElementById("license-status").innerHTML = `<div class="status bad">${escapeHTML(msg)}</div>`;
+}
+
+// Gumroad's license API is CORS-enabled for client-side verification — no backend needed.
+// increment_uses_count:false so re-checking on every page load doesn't burn through the
+// license's use count (Gumroad tracks activations if you ever want to cap device count).
+async function verifyLicense(key, {silent=false}={}){
+  if(!key) return false;
+  try{
+    const r = await fetch("https://api.gumroad.com/v2/licenses/verify", {
+      method:"POST",
+      headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      body:new URLSearchParams({
+        product_permalink: GUMROAD_PRODUCT_PERMALINK,
+        license_key: key,
+        increment_uses_count:"false"
+      })
+    });
+    const d = await r.json();
+    if(d.success && !d.purchase.refunded && !d.purchase.chargebacked){
+      settings.pro = true; settings.licenseKey = key; store.set("settings", settings);
+      unlockPro();
+      if(!silent) document.getElementById("license-status").innerHTML = '<div class="status ok">✅ Pro activated — thank you!</div>';
+      return true;
+    }
+    if(d.success && (d.purchase.refunded || d.purchase.chargebacked)){
+      lockPro(silent ? null : "This license was refunded or charged back.");
+      return false;
+    }
+    if(!silent) lockPro("License key not recognized. Check for typos or contact support.");
+    return false;
+  }catch(err){
+    // Network failure shouldn't punish an already-verified paying user — fail open
+    // for existing Pro sessions, but don't grant new access on a failed check.
+    if(!silent) document.getElementById("license-status").innerHTML = '<div class="status warn">Could not reach the licensing server — try again shortly.</div>';
+    return settings.pro; // leave existing state untouched
+  }
+}
+
+document.getElementById("btn-activate").onclick = ()=>{
+  const key = document.getElementById("license-input").value.trim();
+  if(!key){ document.getElementById("license-status").innerHTML = '<div class="status bad">Paste your license key first.</div>'; return; }
+  document.getElementById("license-status").innerHTML = '<div class="status loading"><span class="spinner"></span> Verifying…</div>';
+  verifyLicense(key);
 };
-if(settings.pro){ document.getElementById("batch-lock").classList.add("hidden"); document.getElementById("batch-ui").classList.remove("hidden"); }
+
+// Re-validate silently on load if we already have a stored key, so a refund/chargeback
+// revokes access next time the app is opened — without bothering the user if it's still valid.
+if(settings.pro && settings.licenseKey){
+  unlockPro(); // optimistic unlock so there's no flash of the lock screen
+  verifyLicense(settings.licenseKey, {silent:true});
+} else if(settings.pro){
+  // legacy state from the old demo-unlock button with no real key behind it — reset it
+  lockPro();
+}
 
 let batchResults = [];
 document.getElementById("btn-batch-run").onclick = async ()=>{
