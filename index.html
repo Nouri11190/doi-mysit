@@ -182,7 +182,7 @@
 <script>
 /* ============ CONFIG ============ */
 const DEFAULT_EMAIL = "jeffreybrook24@gmail.com";
-const DEFAULT_COREKEY 
+const DEFAULT_COREKEY = "UeqtzugkKLdFxJja9p27ily5EOPIM3wb";
 const DOI_RE = /10\.\d{4,9}\/[-._;()\/:A-Za-z0-9]+/;
 
 /* ============ STATE / STORAGE ============ */
@@ -215,13 +215,16 @@ function extractDOI(raw){
   if(!raw) return null;
   let s = raw.trim();
   // strip common URL prefixes
+  // FIX: the second .replace() previously passed `s` (the whole string) as the
+  // replacement value instead of "", which spliced the entire input back into
+  // the match location instead of stripping it. Now correctly strips to "".
   s = s.replace(/^https?:\/\/(dx\.)?doi\.org\//i, "")
-       .replace(/^https?:\/\/(www\.)?(arxiv\.org\/(abs|pdf)\/|link\.springer\.com\/article\/|nature\.com\/articles\/|sciencedirect\.com\/science\/article\/(pii|abs)\/)/i, s);
+       .replace(/^https?:\/\/(www\.)?(arxiv\.org\/(abs|pdf)\/|link\.springer\.com\/article\/|nature\.com\/articles\/|sciencedirect\.com\/science\/article\/(pii|abs)\/)/i, "");
   // handle arXiv id -> not a DOI, caller deals with it
   const m = s.match(DOI_RE);
   if(!m) return null;
   let doi = m[0].replace(/[.,;)]+$/,""); // trim trailing punctuation
-  return doi.toLowerCase() === doi ? doi : doi;
+  return doi.toLowerCase(); // FIX: original ternary returned the same value on both branches (dead code); normalize to lowercase, which DOIs are case-insensitive for anyway.
 }
 
 /* ============ API SOURCES (each returns {found, pdf, landing, title, authors, source} or throws) ============ */
@@ -237,7 +240,13 @@ async function tryUnpaywall(doi){
       title:d.title || d.journal_name || doi, authors:(d.z_authors||[]).map(a=>[a.given,a.family].filter(Boolean).join(" ")).join(", "),
       source:"Unpaywall", license:d.best_oa_location.license, version:d.best_oa_location.version};
   }
-  return {found:false, stop:true}; // known DOI, but no legal OA copy
+  // FIX: this used to be stop:true, which short-circuited the ENTIRE fallback
+  // chain the moment Unpaywall said "no OA" — meaning Semantic Scholar, arXiv,
+  // and CORE were never even queried for any paper Unpaywall already knew about.
+  // That defeats the point of having multiple sources: CORE/S2 often have a
+  // green-OA or repository copy Unpaywall doesn't index. Now it correctly
+  // continues down the chain.
+  return {found:false, stop:false}; // known DOI, but no legal OA copy per Unpaywall — keep trying other sources
 }
 
 async function trySemanticScholar(doi){
