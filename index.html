@@ -153,7 +153,7 @@
     <div class="card">
       <h2>📚 My library</h2>
       <div id="lib-list"></div>
-      <div class="hint">Saved entries are stored locally on this device (offline access). Tap a PDF link to open or download.</div>
+      <div class="hint">Papers marked 📱 offline are fully cached on this device and open without internet. Others are link-only — some sources don't allow the browser to cache their PDF directly, so those still need a connection to open.</div>
     </div>
   </section>
 
@@ -203,7 +203,61 @@ const store = {
 let settings = store.get("settings", { dark:false, coreKey:"", email:DEFAULT_EMAIL, pro:false, licenseKey:"" });
 let cache   = store.get("cache", {});       // doi -> {result, ts}
 let recent  = store.get("recent", []);      // [{doi,title,found,ts}]
-let library = store.get("library", []);     // [{doi,title,url,source,ts}]
+let library = store.get("library", []);     // [{doi,title,url,source,ts,offline}]
+
+/* ============ OFFLINE PDF CACHE (IndexedDB) ============ */
+// localStorage can't hold binary files well and caps out around 5-10MB, so
+// actual PDF bytes go in IndexedDB, keyed by DOI. Not every source can be
+// cached this way: many publisher/repo servers don't send CORS headers on
+// the PDF file itself, so fetch() can't read the bytes even though a normal
+// browser click/download still works fine. Save falls back to link-only
+// when that happens.
+const PDF_DB_NAME = "doaf_pdfs";
+const PDF_STORE_NAME = "pdfs";
+function openPdfDB(){
+  return new Promise((resolve, reject)=>{
+    const req = indexedDB.open(PDF_DB_NAME, 1);
+    req.onupgradeneeded = ()=> req.result.createObjectStore(PDF_STORE_NAME);
+    req.onsuccess = ()=> resolve(req.result);
+    req.onerror = ()=> reject(req.error);
+  });
+}
+async function savePdfBlob(doi, blob){
+  const db = await openPdfDB();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(PDF_STORE_NAME, "readwrite");
+    tx.objectStore(PDF_STORE_NAME).put(blob, doi);
+    tx.oncomplete = ()=> resolve(true);
+    tx.onerror = ()=> reject(tx.error);
+  });
+}
+async function getPdfBlob(doi){
+  const db = await openPdfDB();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(PDF_STORE_NAME, "readonly");
+    const req = tx.objectStore(PDF_STORE_NAME).get(doi);
+    req.onsuccess = ()=> resolve(req.result || null);
+    req.onerror = ()=> reject(req.error);
+  });
+}
+async function deletePdfBlob(doi){
+  const db = await openPdfDB();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(PDF_STORE_NAME, "readwrite");
+    tx.objectStore(PDF_STORE_NAME).delete(doi);
+    tx.oncomplete = ()=> resolve(true);
+    tx.onerror = ()=> reject(tx.error);
+  });
+}
+async function clearAllPdfBlobs(){
+  const db = await openPdfDB();
+  return new Promise((resolve, reject)=>{
+    const tx = db.transaction(PDF_STORE_NAME, "readwrite");
+    tx.objectStore(PDF_STORE_NAME).clear();
+    tx.oncomplete = ()=> resolve(true);
+    tx.onerror = ()=> reject(tx.error);
+  });
+}
 
 function applyTheme(){ document.documentElement.setAttribute("data-theme", settings.dark ? "dark":"light"); document.getElementById("dark-toggle").checked = settings.dark; }
 
@@ -392,7 +446,25 @@ function renderResult(doi, res){
     </div>`;
   resultEl.classList.remove("hidden");
   const sb = document.getElementById("btn-save");
-  if(sb && !saved) sb.onclick = ()=>{ library.unshift({doi, title:res.title||doi, url:res.pdf||res.landing, source:res.source, ts:Date.now()}); store.set("library", library); renderResult(doi, res); };
+  if(sb && !saved) sb.onclick = async ()=>{
+    sb.disabled = true; sb.textContent = "Saving…";
+    let offline = false;
+    if(res.pdf){
+      try{
+        const r = await fetch(res.pdf);
+        if(r.ok){
+          const blob = await r.blob();
+          await savePdfBlob(doi, blob);
+          offline = true;
+        }
+      }catch(e){
+        // CORS-blocked or network-blocked source — fall back to link-only save below.
+      }
+    }
+    library.unshift({doi, title:res.title||doi, url:res.pdf||res.landing, source:res.source, ts:Date.now(), offline});
+    store.set("library", library);
+    renderResult(doi, res);
+  };
   const cb = document.getElementById("btn-cite");
   if(cb) cb.onclick = ()=>{ const cite = `${res.authors?res.authors+". ":""}${res.title||""}. DOI: ${doi}`; navigator.clipboard.writeText(cite).then(()=>{ cb.textContent = "✅ Copied"; }); };
 }
@@ -427,10 +499,24 @@ function renderLibrary(){
       <span class="dot ok"></span>
       <span class="doi">${escapeHTML(l.title)} <span style="opacity:.7">· ${escapeHTML(l.doi)}</span></span>
       <span class="badge ${l.source.toLowerCase().replace(/\s/g,'')}">${escapeHTML(l.source)}</span>
-      <a class="btn secondary small" style="text-decoration:none" href="${escapeHTML(l.url)}" target="_blank" rel="noopener">Open</a>
+      ${l.offline?'<span class="badge none">📱 offline</span>':''}
+      ${l.offline
+        ? `<button class="btn secondary small" data-openoffline="${i}">Open (offline)</button>`
+        : `<a class="btn secondary small" style="text-decoration:none" href="${escapeHTML(l.url)}" target="_blank" rel="noopener">Open</a>`}
       <button class="btn secondary small" data-rm="${i}">Remove</button>
     </div>`).join("");
-  el.querySelectorAll("[data-rm]").forEach(b=> b.onclick = ()=>{ library.splice(+b.dataset.rm,1); store.set("library", library); renderLibrary(); });
+  el.querySelectorAll("[data-rm]").forEach(b=> b.onclick = async ()=>{
+    const i = +b.dataset.rm;
+    const item = library[i];
+    if(item.offline) await deletePdfBlob(item.doi).catch(()=>{});
+    library.splice(i,1); store.set("library", library); renderLibrary();
+  });
+  el.querySelectorAll("[data-openoffline]").forEach(b=> b.onclick = async ()=>{
+    const item = library[+b.dataset.openoffline];
+    const blob = await getPdfBlob(item.doi).catch(()=>null);
+    if(blob){ window.open(URL.createObjectURL(blob), "_blank"); }
+    else{ alert("Offline copy not found — it may have been cleared from this device."); }
+  });
 }
 
 /* ============ BATCH / LICENSING ============ */
@@ -544,7 +630,7 @@ function renderSettings(){
 document.getElementById("dark-toggle").onchange = (e)=>{ settings.dark = e.target.checked; store.set("settings", settings); applyTheme(); };
 document.getElementById("set-email").onchange = (e)=>{ settings.email = e.target.value.trim() || DEFAULT_EMAIL; store.set("settings", settings); };
 document.getElementById("set-corekey").onchange = (e)=>{ settings.coreKey = e.target.value.trim(); store.set("settings", settings); };
-document.getElementById("btn-clear").onclick = ()=>{ cache={}; recent=[]; library=[]; store.set("cache",cache); store.set("recent",recent); store.set("library",library); renderRecent(); alert("Cache, history and library cleared."); };
+document.getElementById("btn-clear").onclick = async ()=>{ cache={}; recent=[]; library=[]; store.set("cache",cache); store.set("recent",recent); store.set("library",library); await clearAllPdfBlobs().catch(()=>{}); renderRecent(); alert("Cache, history, library, and offline PDFs cleared."); };
 
 function escapeHTML(s){ return String(s??"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
 
