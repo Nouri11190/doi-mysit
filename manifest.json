@@ -1,0 +1,14 @@
+{
+  "name": "DOI Open-Access Finder",
+  "short_name": "OA Finder",
+  "description": "Legal open-access aggregation for academic papers — no paywall bypass.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#0f1524",
+  "theme_color": "#2563eb",
+  "icons": [
+    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}
